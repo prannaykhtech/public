@@ -58,12 +58,14 @@ echo "[3/7] Configuring power settings ..."
 # Disable suspend/hibernate/sleep
 sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target 2>/dev/null || true
 # Disable lid close suspend (for mini PCs / laptops used as servers)
+# Note: Do NOT restart systemd-logind here - it terminates GUI sessions
 if [ -f /etc/systemd/logind.conf ]; then
     sudo sed -i 's/^#\?HandleLidSwitch=.*/HandleLidSwitch=ignore/' /etc/systemd/logind.conf
     sudo sed -i 's/^#\?HandleLidSwitchDocked=.*/HandleLidSwitchDocked=ignore/' /etc/systemd/logind.conf
-    sudo systemctl restart systemd-logind 2>/dev/null || true
+    # Changes apply on reboot; restarting logind crashes GUI sessions
 fi
 echo "  Sleep/suspend/hibernate: DISABLED"
+echo "  Lid switch: IGNORE (applies after reboot)"
 echo "  Note: Auto-restart on power loss is typically a BIOS/UEFI setting."
 echo "        Set 'Restore on AC Power Loss' to 'Power On' in BIOS."
 
