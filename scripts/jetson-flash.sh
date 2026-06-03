@@ -269,6 +269,24 @@ extract() {
     fi
 }
 
+# Clean up chroot leftovers from a previous (interrupted) apply_binaries.sh:
+# stale /dev nodes that mknod re-collides on, and stale bind mounts under rootfs/.
+cleanup_chroot_state() {
+    local rootfs="$WORK_DIR/Linux_for_Tegra/rootfs"
+    [ -d "$rootfs" ] || return 0
+
+    # unmount anything still bound under rootfs/
+    if mount | grep -q "$rootfs"; then
+        log "  unmounting stale chroot mounts under rootfs/"
+        mount | awk -v r="$rootfs" '$3 ~ r {print $3}' | tac | xargs -r sudo umount -lf
+    fi
+
+    # remove device nodes apply_binaries tries to recreate via mknod
+    for d in random urandom null zero console tty full ptmx; do
+        sudo rm -f "$rootfs/dev/$d" 2>/dev/null || true
+    done
+}
+
 # ---------- step 5: apply_binaries ----------
 apply_binaries() {
     log "=== apply_binaries.sh ==="
@@ -278,6 +296,7 @@ apply_binaries() {
         log "  apply_binaries already done ($marker present); skipping."
         return 0
     fi
+    cleanup_chroot_state
     sudo ./apply_binaries.sh
     sudo touch "$marker"
 }
