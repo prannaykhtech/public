@@ -1,17 +1,29 @@
 #!/usr/bin/env bash
-# jetson-flash.sh -- Recover/flash a Jetson Orin from an Ubuntu host via USB recovery mode.
+# jetson-flash.sh -- Recover/flash a Jetson Orin from an Ubuntu host via USB recovery mode,
+# pre-seeded for headless first boot (default user, hostname, SSH key, passwordless sudo).
 #
-# RUN ON: an Ubuntu x86_64 host (20.04 / 22.04 / 24.04) with a USB-C cable to the Jetson's
-# recovery port and the Jetson in Force Recovery Mode.
+# RUN ON: an Ubuntu x86_64 host (20.04 / 22.04 / 24.04) with a USB-C cable from the host's
+# USB 3.x port to the Jetson's RECOVERY USB-C port, and the Jetson in Force Recovery Mode.
 #
 # DOES NOT REQUIRE: NVIDIA developer login, SDK Manager, or a GUI. Pure CLI.
 #
 # Default target: Jetson AGX Orin Developer Kit, JetPack 6.2.1 (L4T R36.4.4).
-# Override via env vars:
-#   JETSON_BOARD          (default: jetson-agx-orin-devkit)
-#   L4T_RELEASE           (default: 36.4.4)
-#   L4T_REPO_DIR          (default: r36_release_v4.4)
-#   WORK_DIR              (default: $HOME/jetson-flash/<release>)
+#
+# REQUIRED env vars:
+#   JETSON_HOSTNAME        e.g. guild-orin-1
+#   JETSON_PASS            console password for the seeded user (>= 8 chars).
+#                          SSH should use keys; this is fallback only.
+#
+# OPTIONAL env vars:
+#   JETSON_USER            (default: guild)
+#   JETSON_AUTHORIZED_KEY  path to an SSH public key file to install into authorized_keys
+#                          (default: $HOME/.ssh/id_ed25519.pub on the flashing host)
+#   JETSON_BOARD           (default: jetson-agx-orin-devkit)
+#   L4T_RELEASE            (default: 36.4.4)
+#   L4T_REPO_DIR           (default: r36_release_v4.4)
+#   WORK_DIR               (default: $HOME/jetson-flash/<release>)
+#   ASSUME_YES=1           skip the "press ENTER" confirmation
+#   SKIP_USB3_CHECK=1      skip the USB-3 link-speed assertion (not recommended)
 #
 # Other supported boards (override JETSON_BOARD):
 #   jetson-orin-nano-devkit            (Orin Nano Dev Kit, NVMe)
@@ -20,18 +32,19 @@
 #   jetson-orin-nx-devkit              (with appropriate carrier)
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/prannaykhtech/public/main/scripts/jetson-flash.sh | bash
-#   # or with overrides:
-#   curl -fsSL .../jetson-flash.sh | JETSON_BOARD=jetson-orin-nano-devkit L4T_RELEASE=36.4.4 bash
+#   JETSON_HOSTNAME=guild-orin-1 JETSON_PASS='somepass' \
+#     bash <(curl -fsSL https://raw.githubusercontent.com/prannaykhtech/public/main/scripts/jetson-flash.sh)
 #
 # Steps:
-#   1. preflight: ubuntu host, root sudo, Jetson visible in lsusb (0955:7023 APX)
+#   1. preflight: ubuntu host, root sudo, Jetson in recovery on USB 3.x port, ModemManager off
 #   2. install host prerequisites
 #   3. download BSP + sample rootfs (cached in WORK_DIR; resumes partial downloads)
 #   4. extract BSP, extract rootfs into Linux_for_Tegra/rootfs/
-#   5. run apply_binaries.sh
-#   6. run l4t_flash_prerequisites.sh (newer L4T versions)
-#   7. run flash.sh <board> internal
+#   5. apply_binaries.sh
+#   6. pre-seed user via l4t_create_default_user.sh (skips oem-config wizard)
+#   7. drop SSH authorized_keys + passwordless sudo into rootfs
+#   8. l4t_flash_prerequisites.sh
+#   9. flash.sh <board> internal
 #
 # Total time: ~30-60 min depending on bandwidth (downloads ~3 GB, flash ~15-20 min).
 #
@@ -44,6 +57,9 @@ JETSON_BOARD="${JETSON_BOARD:-jetson-agx-orin-devkit}"
 L4T_RELEASE="${L4T_RELEASE:-36.4.4}"
 L4T_REPO_DIR="${L4T_REPO_DIR:-r36_release_v4.4}"
 WORK_DIR="${WORK_DIR:-$HOME/jetson-flash/$L4T_RELEASE}"
+
+JETSON_USER="${JETSON_USER:-guild}"
+JETSON_AUTHORIZED_KEY="${JETSON_AUTHORIZED_KEY:-$HOME/.ssh/id_ed25519.pub}"
 
 BSP_TARBALL="jetson_linux_r${L4T_RELEASE}_aarch64.tbz2"
 ROOTFS_TARBALL="tegra_linux_sample-root-filesystem_r${L4T_RELEASE}_aarch64.tbz2"
@@ -67,6 +83,12 @@ ensure_log() {
     exec > >(tee -a "$LOG_FILE") 2>&1
 }
 
+require_env() {
+    local name="$1"
+    local val="${!name:-}"
+    [ -n "$val" ] || die "$name must be set."
+}
+
 # ---------- step 1: preflight ----------
 preflight() {
     log "=== preflight ==="
@@ -77,19 +99,73 @@ preflight() {
     log "target:     $JETSON_BOARD"
     log "release:    L4T $L4T_RELEASE ($L4T_REPO_DIR)"
     log "work dir:   $WORK_DIR"
+    log "user:       $JETSON_USER@${JETSON_HOSTNAME:-<unset>}"
+    log "ssh key:    $JETSON_AUTHORIZED_KEY"
 
     [ "$(uname -m)" = "x86_64" ] || die "must run on x86_64 (got $(uname -m))."
     [ "$(uname -s)" = "Linux" ] || die "must run on Linux."
 
+    require_env JETSON_HOSTNAME
+    require_env JETSON_PASS
+    [ "${#JETSON_PASS}" -ge 8 ] || die "JETSON_PASS must be >= 8 chars."
+
     if ! command -v sudo >/dev/null; then die "sudo is required."; fi
-    sudo -n true 2>/dev/null || die "passwordless sudo required (or run script as root)."
+    sudo -n true 2>/dev/null || die "passwordless sudo required (or run as root)."
+
+    if [ -n "$JETSON_AUTHORIZED_KEY" ] && [ ! -f "$JETSON_AUTHORIZED_KEY" ]; then
+        die "JETSON_AUTHORIZED_KEY=$JETSON_AUTHORIZED_KEY does not exist. Provide a valid public key file or unset to skip SSH key setup."
+    fi
+    if [ -n "$JETSON_AUTHORIZED_KEY" ] && ! grep -qE '^(ssh-(rsa|ed25519|dss)|ecdsa-sha2)' "$JETSON_AUTHORIZED_KEY"; then
+        die "JETSON_AUTHORIZED_KEY=$JETSON_AUTHORIZED_KEY does not look like a valid SSH public key."
+    fi
 
     if ! lsusb | grep -q "0955:7023"; then
         log "lsusb output:"
         lsusb | sed 's/^/  /'
-        die "Jetson not visible in recovery mode. Expected USB device 0955:7023 (NVIDIA APX). Put Jetson in Force Recovery Mode (hold REC, tap POWER) and connect USB-C from recovery port to this host."
+        die "Jetson not visible in recovery mode. Expected USB device 0955:7023 (NVIDIA APX). Hold REC + tap POWER on the Jetson, connect USB-C from the recovery port to this host."
     fi
     log "Jetson detected: $(lsusb | grep '0955:7023')"
+
+    if [ "${SKIP_USB3_CHECK:-0}" != "1" ]; then
+        local jetson_speed
+        jetson_speed=$(lsusb -t 2>/dev/null | awk '
+            /Bus / {bus=$0; next}
+            /0955|usbfs/ {print bus; exit}
+        ' || true)
+        local jetson_line
+        jetson_line=$(lsusb -t 2>/dev/null | grep -E "0955" || true)
+        local link_speed
+        link_speed=$(echo "$jetson_line" | grep -oE '[0-9]+M' | head -1 || true)
+        if [ -z "$link_speed" ]; then
+            link_speed=$(lsusb -v -d 0955:7023 2>/dev/null | awk '/bcdUSB/ {print $2; exit}' || true)
+        fi
+        log "Jetson link speed (lsusb -t): ${link_speed:-unknown}"
+        case "$link_speed" in
+            10000M|5000M)
+                log "USB 3.x link OK."
+                ;;
+            480M|480|"")
+                log ""
+                log "WARNING: Jetson is connected at USB 2 speed (480M) or unknown."
+                log "  Flashing usually fails on USB 2 with 'timeout in USB write'."
+                log "  Move the host-side USB-C cable to a USB 3.x port (typically the small USB-C"
+                log "  port on the desktop, or a blue/red USB-A port). Re-trigger recovery and re-run."
+                log "  To override (not recommended), set SKIP_USB3_CHECK=1."
+                die "USB-3 link speed assertion failed (link=$link_speed)."
+                ;;
+        esac
+    fi
+
+    if systemctl is-active --quiet ModemManager 2>/dev/null; then
+        log "Stopping ModemManager (steals Jetson recovery handshake)."
+        sudo systemctl stop ModemManager || true
+    fi
+
+    log "Disabling USB autosuspend on host."
+    for f in /sys/bus/usb/devices/usb*/power/control; do
+        echo on | sudo tee "$f" >/dev/null 2>&1 || true
+    done
+
     confirm_or_abort
 }
 
@@ -106,8 +182,8 @@ install_prereqs() {
         sshpass \
         libxml2-utils \
         binutils \
-        sudo \
-        tar bzip2 xz-utils
+        tar bzip2 xz-utils \
+        whois
     log "prereqs installed."
 }
 
@@ -161,7 +237,69 @@ apply_binaries() {
     sudo ./apply_binaries.sh
 }
 
-# ---------- step 6: l4t_flash_prerequisites ----------
+# ---------- step 6: pre-seed default user (skip oem-config) ----------
+preseed_user() {
+    log "=== pre-seed default user $JETSON_USER@$JETSON_HOSTNAME ==="
+    cd "$WORK_DIR/Linux_for_Tegra"
+    if [ ! -x tools/l4t_create_default_user.sh ]; then
+        die "tools/l4t_create_default_user.sh missing -- BSP layout unexpected."
+    fi
+    sudo ./tools/l4t_create_default_user.sh \
+        -u "$JETSON_USER" \
+        -p "$JETSON_PASS" \
+        -n "$JETSON_HOSTNAME" \
+        --accept-license
+    log "default user '$JETSON_USER' seeded with hostname '$JETSON_HOSTNAME'; oem-config wizard disabled."
+}
+
+# ---------- step 7: ssh key + passwordless sudo into rootfs ----------
+seed_remote_access() {
+    log "=== seed SSH authorized_keys + passwordless sudo ==="
+    local ROOTFS="$WORK_DIR/Linux_for_Tegra/rootfs"
+    local USER_HOME="$ROOTFS/home/$JETSON_USER"
+
+    if [ ! -d "$USER_HOME" ]; then
+        die "$USER_HOME missing -- pre-seed step did not create user home."
+    fi
+
+    # SSH key
+    if [ -n "$JETSON_AUTHORIZED_KEY" ] && [ -f "$JETSON_AUTHORIZED_KEY" ]; then
+        log "installing ssh public key from $JETSON_AUTHORIZED_KEY"
+        sudo mkdir -p "$USER_HOME/.ssh"
+        sudo cp "$JETSON_AUTHORIZED_KEY" "$USER_HOME/.ssh/authorized_keys"
+        sudo chmod 700 "$USER_HOME/.ssh"
+        sudo chmod 600 "$USER_HOME/.ssh/authorized_keys"
+        # The l4t_create_default_user.sh sets uid 1000 / gid 1000 for the seeded user.
+        sudo chown -R 1000:1000 "$USER_HOME/.ssh"
+    else
+        log "no SSH key provided; skipping authorized_keys setup."
+    fi
+
+    # passwordless sudo
+    log "installing /etc/sudoers.d/$JETSON_USER (NOPASSWD: ALL)"
+    local SUDOERS_DIR="$ROOTFS/etc/sudoers.d"
+    sudo mkdir -p "$SUDOERS_DIR"
+    local SUDOERS_FILE="$SUDOERS_DIR/$JETSON_USER"
+    echo "$JETSON_USER ALL=(ALL) NOPASSWD: ALL" | sudo tee "$SUDOERS_FILE" >/dev/null
+    sudo chmod 0440 "$SUDOERS_FILE"
+    sudo chown 0:0 "$SUDOERS_FILE"
+
+    # Make sure ssh is enabled at boot. On JP6 sample rootfs, openssh-server is
+    # already installed; mask the multi-user wait by ensuring the service is
+    # enabled in the offline rootfs.
+    if [ -d "$ROOTFS/etc/systemd/system/multi-user.target.wants" ]; then
+        if [ -f "$ROOTFS/lib/systemd/system/ssh.service" ] && \
+           [ ! -L "$ROOTFS/etc/systemd/system/multi-user.target.wants/ssh.service" ]; then
+            log "enabling ssh.service in rootfs"
+            sudo ln -sf /lib/systemd/system/ssh.service \
+                "$ROOTFS/etc/systemd/system/multi-user.target.wants/ssh.service"
+        fi
+    fi
+
+    log "remote access seeded."
+}
+
+# ---------- step 8: l4t_flash_prerequisites ----------
 flash_prereqs() {
     log "=== l4t_flash_prerequisites.sh ==="
     cd "$WORK_DIR/Linux_for_Tegra"
@@ -172,12 +310,12 @@ flash_prereqs() {
     fi
 }
 
-# ---------- step 7: flash ----------
+# ---------- step 9: flash ----------
 flash_device() {
     log "=== flash $JETSON_BOARD ==="
     cd "$WORK_DIR/Linux_for_Tegra"
     if ! lsusb | grep -q "0955:7023"; then
-        die "Jetson no longer in recovery mode. Re-trigger recovery and re-run."
+        die "Jetson no longer in recovery mode. Re-trigger recovery and re-run flash."
     fi
     sudo ./flash.sh "$JETSON_BOARD" internal
     log "=== flash complete ==="
@@ -193,6 +331,8 @@ main() {
     download
     extract
     apply_binaries
+    preseed_user
+    seed_remote_access
     flash_prereqs
     flash_device
 
@@ -201,32 +341,28 @@ main() {
 ============================================================
   FLASH COMPLETE
 ============================================================
-  Board:    $JETSON_BOARD
-  Release:  L4T $L4T_RELEASE
-  Log:      $LOG_FILE
+  Board:       $JETSON_BOARD
+  Release:     L4T $L4T_RELEASE
+  Hostname:    $JETSON_HOSTNAME
+  User:        $JETSON_USER (passwordless sudo)
+  SSH key:     $([ -f "$JETSON_AUTHORIZED_KEY" ] && echo "$JETSON_AUTHORIZED_KEY -> authorized_keys" || echo "(none)")
+  Log:         $LOG_FILE
 
-Next steps on the Jetson:
-  1. Disconnect the recovery USB-C cable.
-  2. Reboot or power-cycle the Jetson.
-  3. The first boot runs Ubuntu's oem-config wizard:
-       - if you have a monitor + keyboard, complete it interactively.
-       - otherwise, see Linux_for_Tegra/tools/l4t_create_default_user.sh
-         to pre-seed a user before flashing (re-flash required).
-  4. After first-boot user creation, enable SSH (already on by default
-     in JetPack 6.x) and connect via LAN.
-  5. Install SDK components (CUDA, cuDNN, TensorRT, OpenCV, VPI):
+Next steps:
+  1. Disconnect the recovery USB-C cable from the Jetson.
+  2. Power-cycle the Jetson (it auto-reboots after a successful flash).
+  3. The Jetson boots straight to multi-user (no oem-config wizard) and
+     gets a DHCP lease on Ethernet.
+  4. From your laptop, connect:
+       ssh $JETSON_USER@$JETSON_HOSTNAME.local
+     (or, once the Twingate connector is reinstalled,
+       ssh $JETSON_USER@$JETSON_HOSTNAME.internal)
+  5. Install JetPack SDK components on the Jetson:
        sudo apt update
        sudo apt install -y nvidia-jetpack
        echo 'export PATH=/usr/local/cuda/bin:\$PATH' >> ~/.bashrc
        echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:\$LD_LIBRARY_PATH' >> ~/.bashrc
-
-To pre-seed username/password instead of running oem-config (recommended
-for headless flashing), run BEFORE the flash step:
-
-  sudo ./tools/l4t_create_default_user.sh \\
-      -u <username> -p <password> -n <hostname> --accept-license
-
-Then call this script with FLASH_PRESEEDED=1 to skip extraction next time.
+  6. Re-deploy the Twingate connector (see twingate.md in the inventory repo).
 
 ============================================================
 EOF
