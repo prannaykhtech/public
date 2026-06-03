@@ -134,31 +134,33 @@ preflight() {
     log "Jetson detected: $(lsusb | grep '0955:7023')"
 
     if [ "${SKIP_USB3_CHECK:-0}" != "1" ]; then
-        local jetson_speed
-        jetson_speed=$(lsusb -t 2>/dev/null | awk '
-            /Bus / {bus=$0; next}
-            /0955|usbfs/ {print bus; exit}
-        ' || true)
-        local jetson_line
+        local jetson_line link_speed
         jetson_line=$(lsusb -t 2>/dev/null | grep -E "0955" || true)
-        local link_speed
         link_speed=$(echo "$jetson_line" | grep -oE '[0-9]+M' | head -1 || true)
         if [ -z "$link_speed" ]; then
-            link_speed=$(lsusb -v -d 0955:7023 2>/dev/null | awk '/bcdUSB/ {print $2; exit}' || true)
+            local bcd
+            bcd=$(lsusb -v -d 0955:7023 2>/dev/null | awk '/bcdUSB/ {print $2; exit}' || true)
+            case "$bcd" in
+                3.*) link_speed="5000M" ;;
+                2.*) link_speed="480M" ;;
+                1.*) link_speed="12M" ;;
+                *)   link_speed="unknown" ;;
+            esac
         fi
-        log "Jetson link speed (lsusb -t): ${link_speed:-unknown}"
+        log "Jetson link speed: $link_speed"
         case "$link_speed" in
             10000M|5000M)
-                log "USB 3.x link OK."
+                log "  USB 3.x link OK."
                 ;;
-            480M|480|"")
+            480M|12M|unknown)
                 log ""
-                log "WARNING: Jetson is connected at USB 2 speed (480M) or unknown."
-                log "  Flashing usually fails on USB 2 with 'timeout in USB write'."
-                log "  Move the host-side USB-C cable to a USB 3.x port (typically the small USB-C"
-                log "  port on the desktop, or a blue/red USB-A port). Re-trigger recovery and re-run."
-                log "  To override (not recommended), set SKIP_USB3_CHECK=1."
-                die "USB-3 link speed assertion failed (link=$link_speed)."
+                log "  WARNING: Jetson is connected at USB 2 speed or lower."
+                log "  Flashing on USB 2 sometimes fails with 'timeout in USB write' at the BCT stage,"
+                log "  but on AGX Orin Dev Kits it has been observed to work as well."
+                log "  If you hit a BCT timeout, move the host-side USB-C cable to a USB 3.x port and"
+                log "  re-trigger recovery. To proceed anyway (or to skip this check entirely),"
+                log "  set SKIP_USB3_CHECK=1."
+                die "USB link speed below USB 3 (got $link_speed). Set SKIP_USB3_CHECK=1 to override."
                 ;;
         esac
     fi
@@ -270,21 +272,38 @@ extract() {
 }
 
 # Clean up chroot leftovers from a previous (interrupted) apply_binaries.sh:
-# stale /dev nodes that mknod re-collides on, and stale bind mounts under rootfs/.
+#   - bind mounts under rootfs/ (proc, sys, dev/pts)
+#   - /dev nodes that mknod re-collides on
+#   - dpkg/apt lock files held by a now-dead chroot dpkg
 cleanup_chroot_state() {
     local rootfs="$WORK_DIR/Linux_for_Tegra/rootfs"
     [ -d "$rootfs" ] || return 0
 
-    # unmount anything still bound under rootfs/
     if mount | grep -q "$rootfs"; then
         log "  unmounting stale chroot mounts under rootfs/"
         mount | awk -v r="$rootfs" '$3 ~ r {print $3}' | tac | xargs -r sudo umount -lf
     fi
 
-    # remove device nodes apply_binaries tries to recreate via mknod
     for d in random urandom null zero console tty full ptmx; do
         sudo rm -f "$rootfs/dev/$d" 2>/dev/null || true
     done
+
+    # Stale dpkg/apt locks from a previous chroot-dpkg that was killed.
+    # These are normally owned by a now-dead PID; safe to remove on the host.
+    for lock in \
+        var/lib/dpkg/lock \
+        var/lib/dpkg/lock-frontend \
+        var/lib/apt/lists/lock \
+        var/cache/apt/archives/lock; do
+        sudo rm -f "$rootfs/$lock" 2>/dev/null || true
+    done
+
+    # Kill any qemu-aarch64-static or chroot-rooted dpkg processes still alive
+    # from a previous apply_binaries that was Ctrl-C'd.
+    if pgrep -f "qemu-aarch64-static.*$rootfs" >/dev/null 2>&1; then
+        log "  killing leftover qemu-aarch64-static processes from previous run"
+        sudo pkill -9 -f "qemu-aarch64-static.*$rootfs" || true
+    fi
 }
 
 # ---------- step 5: apply_binaries ----------
