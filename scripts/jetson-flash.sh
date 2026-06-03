@@ -25,6 +25,13 @@
 #   ASSUME_YES=1           skip the "press ENTER" confirmation
 #   SKIP_USB3_CHECK=1      skip the USB-3 link-speed assertion (not recommended)
 #
+# Force-redo flags (default: skip steps that are already done):
+#   FORCE_REINSTALL_PREREQS=1   re-run apt install for host packages
+#   FORCE_REEXTRACT=1           wipe Linux_for_Tegra/ and re-extract from tarballs
+#   FORCE_REAPPLY=1             re-run apply_binaries.sh
+#   FORCE_RESEED_USER=1         re-run l4t_create_default_user.sh
+#   FORCE_REPREQ=1              re-run tools/l4t_flash_prerequisites.sh
+#
 # Other supported boards (override JETSON_BOARD):
 #   jetson-orin-nano-devkit            (Orin Nano Dev Kit, NVMe)
 #   jetson-orin-nano-devkit-super      (Orin Nano "Super" Dev Kit)
@@ -170,21 +177,38 @@ preflight() {
 }
 
 # ---------- step 2: host prereqs ----------
+HOST_PKGS=(
+    wget curl ca-certificates
+    qemu-user-static
+    lbzip2
+    abootimg
+    python3 python3-pip
+    sshpass
+    libxml2-utils
+    binutils
+    tar bzip2 xz-utils
+    whois
+)
+
 install_prereqs() {
-    log "=== install host prerequisites ==="
+    log "=== host prerequisites ==="
+    local missing=()
+    for p in "${HOST_PKGS[@]}"; do
+        if ! dpkg-query -W -f='${Status}\n' "$p" 2>/dev/null | grep -q "install ok installed"; then
+            missing+=("$p")
+        fi
+    done
+    if [ "${FORCE_REINSTALL_PREREQS:-0}" = "1" ]; then
+        missing=("${HOST_PKGS[@]}")
+    fi
+    if [ ${#missing[@]} -eq 0 ]; then
+        log "  all ${#HOST_PKGS[@]} packages already installed; skipping apt."
+        return 0
+    fi
+    log "  missing: ${missing[*]}"
     sudo apt-get update -qq
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        wget curl ca-certificates \
-        qemu-user-static \
-        lbzip2 \
-        abootimg \
-        python3 python3-pip \
-        sshpass \
-        libxml2-utils \
-        binutils \
-        tar bzip2 xz-utils \
-        whois
-    log "prereqs installed."
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}"
+    log "  installed."
 }
 
 # ---------- step 3: download BSP + rootfs ----------
@@ -214,27 +238,48 @@ download() {
 
 # ---------- step 4: extract ----------
 extract() {
-    log "=== extract BSP ==="
+    log "=== extract BSP + rootfs ==="
     cd "$WORK_DIR"
-    if [ -d "Linux_for_Tegra" ]; then
-        log "  Linux_for_Tegra/ exists; removing for clean extract."
+
+    local bsp_marker="Linux_for_Tegra/flash.sh"
+    local rootfs_marker="Linux_for_Tegra/rootfs/usr/bin/dpkg"
+
+    if [ "${FORCE_REEXTRACT:-0}" = "1" ] && [ -d "Linux_for_Tegra" ]; then
+        log "  FORCE_REEXTRACT=1: removing existing Linux_for_Tegra/."
         sudo rm -rf "Linux_for_Tegra"
     fi
-    tar xpf "downloads/$BSP_TARBALL"
-    [ -d Linux_for_Tegra ] || die "Linux_for_Tegra/ missing after BSP extract."
 
-    log "=== extract sample rootfs ==="
-    cd Linux_for_Tegra/rootfs
-    sudo tar xpf "$WORK_DIR/downloads/$ROOTFS_TARBALL"
-    sudo chown -R root:root "$WORK_DIR/Linux_for_Tegra/rootfs"
-    cd "$WORK_DIR"
+    if [ -f "$bsp_marker" ]; then
+        log "  BSP already extracted ($bsp_marker present); skipping."
+    else
+        log "  extracting BSP..."
+        tar xpf "downloads/$BSP_TARBALL"
+        [ -f "$bsp_marker" ] || die "BSP extract failed -- $bsp_marker missing."
+    fi
+
+    if [ -f "$rootfs_marker" ]; then
+        log "  rootfs already extracted ($rootfs_marker present); skipping."
+    else
+        log "  extracting sample rootfs..."
+        cd Linux_for_Tegra/rootfs
+        sudo tar xpf "$WORK_DIR/downloads/$ROOTFS_TARBALL"
+        sudo chown -R root:root "$WORK_DIR/Linux_for_Tegra/rootfs"
+        cd "$WORK_DIR"
+        [ -f "$rootfs_marker" ] || die "rootfs extract failed -- $rootfs_marker missing."
+    fi
 }
 
 # ---------- step 5: apply_binaries ----------
 apply_binaries() {
     log "=== apply_binaries.sh ==="
     cd "$WORK_DIR/Linux_for_Tegra"
+    local marker=".apply_binaries.done"
+    if [ "${FORCE_REAPPLY:-0}" != "1" ] && [ -f "$marker" ]; then
+        log "  apply_binaries already done ($marker present); skipping."
+        return 0
+    fi
     sudo ./apply_binaries.sh
+    sudo touch "$marker"
 }
 
 # ---------- step 6: pre-seed default user (skip oem-config) ----------
@@ -244,12 +289,24 @@ preseed_user() {
     if [ ! -x tools/l4t_create_default_user.sh ]; then
         die "tools/l4t_create_default_user.sh missing -- BSP layout unexpected."
     fi
+
+    local rootfs_passwd="rootfs/etc/passwd"
+    local rootfs_hostname="rootfs/etc/hostname"
+    if [ "${FORCE_RESEED_USER:-0}" != "1" ] \
+       && [ -f "$rootfs_passwd" ] \
+       && grep -q "^${JETSON_USER}:" "$rootfs_passwd" \
+       && [ -f "$rootfs_hostname" ] \
+       && [ "$(cat "$rootfs_hostname" 2>/dev/null)" = "$JETSON_HOSTNAME" ]; then
+        log "  user '$JETSON_USER' and hostname '$JETSON_HOSTNAME' already in rootfs; skipping."
+        return 0
+    fi
+
     sudo ./tools/l4t_create_default_user.sh \
         -u "$JETSON_USER" \
         -p "$JETSON_PASS" \
         -n "$JETSON_HOSTNAME" \
         --accept-license
-    log "default user '$JETSON_USER' seeded with hostname '$JETSON_HOSTNAME'; oem-config wizard disabled."
+    log "  default user '$JETSON_USER' seeded with hostname '$JETSON_HOSTNAME'; oem-config wizard disabled."
 }
 
 # ---------- step 7: ssh key + passwordless sudo into rootfs ----------
@@ -264,25 +321,35 @@ seed_remote_access() {
 
     # SSH key
     if [ -n "$JETSON_AUTHORIZED_KEY" ] && [ -f "$JETSON_AUTHORIZED_KEY" ]; then
-        log "installing ssh public key from $JETSON_AUTHORIZED_KEY"
-        sudo mkdir -p "$USER_HOME/.ssh"
-        sudo cp "$JETSON_AUTHORIZED_KEY" "$USER_HOME/.ssh/authorized_keys"
-        sudo chmod 700 "$USER_HOME/.ssh"
-        sudo chmod 600 "$USER_HOME/.ssh/authorized_keys"
-        # The l4t_create_default_user.sh sets uid 1000 / gid 1000 for the seeded user.
-        sudo chown -R 1000:1000 "$USER_HOME/.ssh"
+        local AK="$USER_HOME/.ssh/authorized_keys"
+        if [ -f "$AK" ] && sudo cmp -s "$JETSON_AUTHORIZED_KEY" "$AK"; then
+            log "  ssh authorized_keys already installed and matches; skipping."
+        else
+            log "  installing ssh public key from $JETSON_AUTHORIZED_KEY"
+            sudo mkdir -p "$USER_HOME/.ssh"
+            sudo cp "$JETSON_AUTHORIZED_KEY" "$AK"
+            sudo chmod 700 "$USER_HOME/.ssh"
+            sudo chmod 600 "$AK"
+            # The l4t_create_default_user.sh sets uid 1000 / gid 1000 for the seeded user.
+            sudo chown -R 1000:1000 "$USER_HOME/.ssh"
+        fi
     else
-        log "no SSH key provided; skipping authorized_keys setup."
+        log "  no SSH key provided; skipping authorized_keys setup."
     fi
 
     # passwordless sudo
-    log "installing /etc/sudoers.d/$JETSON_USER (NOPASSWD: ALL)"
     local SUDOERS_DIR="$ROOTFS/etc/sudoers.d"
-    sudo mkdir -p "$SUDOERS_DIR"
     local SUDOERS_FILE="$SUDOERS_DIR/$JETSON_USER"
-    echo "$JETSON_USER ALL=(ALL) NOPASSWD: ALL" | sudo tee "$SUDOERS_FILE" >/dev/null
-    sudo chmod 0440 "$SUDOERS_FILE"
-    sudo chown 0:0 "$SUDOERS_FILE"
+    local SUDOERS_LINE="$JETSON_USER ALL=(ALL) NOPASSWD: ALL"
+    if [ -f "$SUDOERS_FILE" ] && sudo grep -qxF "$SUDOERS_LINE" "$SUDOERS_FILE"; then
+        log "  sudoers entry for '$JETSON_USER' already present; skipping."
+    else
+        log "  installing /etc/sudoers.d/$JETSON_USER (NOPASSWD: ALL)"
+        sudo mkdir -p "$SUDOERS_DIR"
+        echo "$SUDOERS_LINE" | sudo tee "$SUDOERS_FILE" >/dev/null
+        sudo chmod 0440 "$SUDOERS_FILE"
+        sudo chown 0:0 "$SUDOERS_FILE"
+    fi
 
     # Make sure ssh is enabled at boot. On JP6 sample rootfs, openssh-server is
     # already installed; mask the multi-user wait by ensuring the service is
@@ -303,8 +370,14 @@ seed_remote_access() {
 flash_prereqs() {
     log "=== l4t_flash_prerequisites.sh ==="
     cd "$WORK_DIR/Linux_for_Tegra"
+    local marker=".l4t_flash_prereqs.done"
+    if [ "${FORCE_REPREQ:-0}" != "1" ] && [ -f "$marker" ]; then
+        log "  l4t_flash_prerequisites already done ($marker present); skipping."
+        return 0
+    fi
     if [ -x tools/l4t_flash_prerequisites.sh ]; then
         sudo ./tools/l4t_flash_prerequisites.sh
+        sudo touch "$marker"
     else
         log "  tools/l4t_flash_prerequisites.sh not present (older L4T?), skipping."
     fi
