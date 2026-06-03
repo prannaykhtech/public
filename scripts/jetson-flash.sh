@@ -25,7 +25,16 @@
 #   ASSUME_YES=1           skip the "press ENTER" confirmation
 #   SKIP_USB3_CHECK=1      skip the USB-3 link-speed assertion (not recommended)
 #
-# Force-redo flags (default: skip steps that are already done):
+# CLI flags:
+#   --clean-apply          unmount stale chroot mounts, kill leftover qemu
+#                          processes, remove stale dpkg locks, wipe rootfs/
+#                          and the apply markers, then re-extract rootfs and
+#                          re-run apply_binaries.sh. Use this if a previous
+#                          run corrupted the rootfs (e.g. broken setuid).
+#                          Keeps the BSP extract and the cached tarballs.
+#   --help                 print usage
+#
+# Force-redo env flags (default: skip steps that are already done):
 #   FORCE_REINSTALL_PREREQS=1   re-run apt install for host packages
 #   FORCE_REEXTRACT=1           wipe Linux_for_Tegra/ and re-extract from tarballs
 #   FORCE_REAPPLY=1             re-run apply_binaries.sh
@@ -263,11 +272,19 @@ extract() {
         log "  rootfs already extracted ($rootfs_marker present); skipping."
     else
         log "  extracting sample rootfs..."
-        cd Linux_for_Tegra/rootfs
-        sudo tar xpf "$WORK_DIR/downloads/$ROOTFS_TARBALL"
-        sudo chown -R root:root "$WORK_DIR/Linux_for_Tegra/rootfs"
-        cd "$WORK_DIR"
+        # Extract as root so ownership/permissions in the tarball are preserved
+        # (including setuid bits on /usr/bin/sudo, /bin/su, /usr/bin/mount, etc.).
+        # DO NOT chown -R root:root afterwards -- chown strips setuid by design,
+        # which silently breaks the chrooted apply_binaries and the on-target sudo.
+        sudo tar xpf "$WORK_DIR/downloads/$ROOTFS_TARBALL" \
+            -C "$WORK_DIR/Linux_for_Tegra/rootfs"
         [ -f "$rootfs_marker" ] || die "rootfs extract failed -- $rootfs_marker missing."
+
+        # Sanity check: the sample rootfs should ship sudo as setuid root.
+        local sudo_path="$WORK_DIR/Linux_for_Tegra/rootfs/usr/bin/sudo"
+        if [ -f "$sudo_path" ] && ! sudo find "$sudo_path" -perm -4000 -user root | grep -q .; then
+            die "post-extract: $sudo_path is not setuid-root. Tarball or extraction is bad."
+        fi
     fi
 }
 
@@ -432,14 +449,68 @@ flash_device() {
     log "=== flash complete ==="
 }
 
+# ---------- --clean-apply ----------
+# Wipe rootfs + apply marker + chroot leftovers so the next run cleanly
+# re-extracts the sample rootfs and re-runs apply_binaries.sh. Keeps the
+# BSP extract and the cached tarballs (those aren't corrupted).
+clean_apply() {
+    log "=== --clean-apply ==="
+    local lft="$WORK_DIR/Linux_for_Tegra"
+
+    if [ ! -d "$lft" ]; then
+        log "  $lft not present; nothing to clean."
+        return 0
+    fi
+
+    cleanup_chroot_state
+
+    if [ -d "$lft/rootfs" ]; then
+        log "  removing $lft/rootfs (will be re-extracted from cached tarball)"
+        sudo rm -rf "$lft/rootfs"
+        mkdir -p "$lft/rootfs"
+    fi
+
+    sudo rm -f "$lft/.apply_binaries.done" "$lft/.l4t_flash_prereqs.done" 2>/dev/null
+
+    log "  ready for clean apply_binaries on next run."
+}
+
+usage() {
+    cat <<EOF
+usage: jetson-flash.sh [--clean-apply] [--help]
+
+  --clean-apply   wipe rootfs + apply markers, unmount stale chroot mounts,
+                  kill stale qemu processes, and remove stale dpkg locks before
+                  proceeding. Use this if a previous run was interrupted or
+                  left rootfs in a corrupted state (e.g. setuid bits stripped).
+  --help          this message
+
+See the script header for required and optional environment variables.
+EOF
+}
+
 # ---------- driver ----------
 main() {
+    local DO_CLEAN_APPLY=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --clean-apply) DO_CLEAN_APPLY=1; shift ;;
+            -h|--help)     usage; exit 0 ;;
+            *) die "unknown argument: $1 (try --help)" ;;
+        esac
+    done
+
     ensure_log
     log "log: $LOG_FILE"
 
     preflight
     install_prereqs
     download
+
+    if [ "$DO_CLEAN_APPLY" = "1" ]; then
+        clean_apply
+    fi
+
     extract
     apply_binaries
     preseed_user
